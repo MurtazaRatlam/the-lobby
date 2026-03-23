@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply text-slate-900 antialiased;
+  background: #f8fafc;
+}
+
+* {
+  @apply border-slate-200;
+}
+
+@layer components {
+  .app-surface {
+    @apply border border-slate-200 bg-white;
+  }
+}
