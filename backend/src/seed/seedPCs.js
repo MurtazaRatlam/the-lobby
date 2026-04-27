@@ -1,6 +1,5 @@
-import db from "../models/index.js";
-
-const { PC } = db;
+import { count } from "drizzle-orm";
+import { db, pcs } from "../db/index.js";
 
 const seed = [
   { id: 1, room: "left", position: "bottom" },
@@ -21,8 +20,8 @@ const seed = [
 ];
 
 export const seedPCsIfEmpty = async () => {
-  const count = await PC.count();
-  if (count === 0) {
-    await PC.bulkCreate(seed.map((pc) => ({ ...pc, status: "available" })));
+  const [row] = await db.select({ c: count() }).from(pcs);
+  if (Number(row?.c ?? 0) === 0) {
+    await db.insert(pcs).values(seed.map((pc) => ({ ...pc, status: "available" })));
   }
 };

@@ -1,237 +1,263 @@
-import { Op } from "sequelize";
-import db from "../models/index.js";
+import { and, count, eq, gte, isNull, sql, sum } from "drizzle-orm";
+import {
+  customers,
+  db,
+  pcs,
+  products,
+  sessionPauses,
+  sessionProducts,
+  sessions
+} from "../db/index.js";
 import {
   calculatePausedMilliseconds,
   calculatePcPayableWithPaused
 } from "../utils/sessionCalculator.js";
 
-const { sequelize, Session, PC, Customer, SessionProduct, Product, SessionPause } = db;
-
 export const startSession = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { pcId, customerId, customerName, customerPhone } = req.body;
 
-    const pc = await PC.findByPk(pcId, { transaction: tx });
-    if (!pc) throw new Error("PC not found");
-    if (pc.status !== "available") throw new Error("PC is already in use");
+    await db.transaction(async (tx) => {
+      const [pc] = await tx.select().from(pcs).where(eq(pcs.id, pcId));
+      if (!pc) throw new Error("PC not found");
+      if (pc.status !== "available") throw new Error("PC is already in use");
 
-    let finalCustomerId = customerId;
-    if (!finalCustomerId) {
-      const customer = await Customer.create(
-        { name: customerName, phone: customerPhone },
-        { transaction: tx }
-      );
-      finalCustomerId = customer.id;
-    }
+      let finalCustomerId = customerId;
+      if (!finalCustomerId) {
+        const [customer] = await tx
+          .insert(customers)
+          .values({ name: customerName, phone: customerPhone })
+          .returning();
+        finalCustomerId = customer.id;
+      }
 
-    const session = await Session.create(
-      {
-        customerId: finalCustomerId,
-        pcId,
-        loginTime: new Date(),
-        paidAmount: 0,
-        sessionStatus: "active"
-      },
-      { transaction: tx }
-    );
+      const [session] = await tx
+        .insert(sessions)
+        .values({
+          customerId: finalCustomerId,
+          pcId,
+          loginTime: new Date(),
+          paidAmount: 0,
+          sessionStatus: "active"
+        })
+        .returning();
 
-    await pc.update({ status: "in_use" }, { transaction: tx });
-    await tx.commit();
-    res.status(201).json(session);
+      await tx
+        .update(pcs)
+        .set({ status: "in_use", updatedAt: new Date() })
+        .where(eq(pcs.id, pcId));
+
+      res.status(201).json(session);
+    });
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
 
 export const logoutSession = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { sessionId } = req.params;
     const { customLogoutTime, paidAmount } = req.body;
 
-    const session = await Session.findByPk(sessionId, { transaction: tx });
-    if (!session || session.sessionStatus !== "active") {
-      throw new Error("Active session not found");
-    }
+    await db.transaction(async (tx) => {
+      const [session] = await tx.select().from(sessions).where(eq(sessions.id, Number(sessionId)));
+      if (!session || session.sessionStatus !== "active") {
+        throw new Error("Active session not found");
+      }
 
-    const logoutTime = customLogoutTime ? new Date(customLogoutTime) : new Date();
-    const isCustomLogout = Boolean(customLogoutTime);
+      const logoutTime = customLogoutTime ? new Date(customLogoutTime) : new Date();
+      const isCustomLogout = Boolean(customLogoutTime);
 
-    const pauses = await SessionPause.findAll({
-      where: { sessionId: session.id },
-      transaction: tx
-    });
-    const pausedMs = calculatePausedMilliseconds(pauses, logoutTime);
-    const { totalHours, pcPayable } = calculatePcPayableWithPaused(
-      session.loginTime,
-      logoutTime,
-      pausedMs
-    );
-
-    const lines = await SessionProduct.findAll({
-      where: { sessionId: session.id },
-      transaction: tx
-    });
-    const productsTotal = lines.reduce(
-      (sum, line) => sum + Number(line.quantity) * Number(line.unitPrice),
-      0
-    );
-    const payableAmount = pcPayable + productsTotal;
-
-    const hasPaidAmount = paidAmount !== undefined && paidAmount !== null && paidAmount !== "";
-    const finalPaidAmount = hasPaidAmount ? Number(paidAmount) : payableAmount;
-    const pendingAmount = Math.max(0, payableAmount - finalPaidAmount);
-
-    await session.update(
-      {
+      const pauses = await tx
+        .select()
+        .from(sessionPauses)
+        .where(eq(sessionPauses.sessionId, session.id));
+      const pausedMs = calculatePausedMilliseconds(pauses, logoutTime);
+      const { totalHours, pcPayable } = calculatePcPayableWithPaused(
+        session.loginTime,
         logoutTime,
-        totalHours,
-        payableAmount,
-        paidAmount: finalPaidAmount,
-        pendingAmount,
-        isCustomLogout,
-        sessionStatus: "completed"
-      },
-      { transaction: tx }
-    );
+        pausedMs
+      );
 
-    const pc = await PC.findByPk(session.pcId, { transaction: tx });
-    await pc.update({ status: "available" }, { transaction: tx });
+      const lines = await tx
+        .select()
+        .from(sessionProducts)
+        .where(eq(sessionProducts.sessionId, session.id));
+      const productsTotal = lines.reduce(
+        (acc, line) => acc + Number(line.quantity) * Number(line.unitPrice),
+        0
+      );
+      const payableAmount = pcPayable + productsTotal;
 
-    await tx.commit();
-    res.json(session);
+      const hasPaidAmount = paidAmount !== undefined && paidAmount !== null && paidAmount !== "";
+      const finalPaidAmount = hasPaidAmount ? Number(paidAmount) : payableAmount;
+      const pendingAmount = Math.max(0, payableAmount - finalPaidAmount);
+
+      await tx
+        .update(sessions)
+        .set({
+          logoutTime,
+          totalHours,
+          payableAmount,
+          paidAmount: finalPaidAmount,
+          pendingAmount,
+          isCustomLogout,
+          sessionStatus: "completed",
+          updatedAt: new Date()
+        })
+        .where(eq(sessions.id, session.id));
+
+      await tx
+        .update(pcs)
+        .set({ status: "available", updatedAt: new Date() })
+        .where(eq(pcs.id, session.pcId));
+
+      const [updated] = await tx.select().from(sessions).where(eq(sessions.id, session.id));
+      res.json(updated);
+    });
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
 
 export const addSessionProduct = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { sessionId } = req.params;
     const { productId, quantity = 1 } = req.body;
 
-    const session = await Session.findByPk(sessionId, { transaction: tx });
-    if (!session || session.sessionStatus !== "active") {
-      throw new Error("Active session not found");
-    }
+    await db.transaction(async (tx) => {
+      const [session] = await tx.select().from(sessions).where(eq(sessions.id, Number(sessionId)));
+      if (!session || session.sessionStatus !== "active") {
+        throw new Error("Active session not found");
+      }
 
-    const product = await Product.findByPk(productId, { transaction: tx });
-    if (!product) throw new Error("Product not found");
+      const [product] = await tx.select().from(products).where(eq(products.id, productId));
+      if (!product) throw new Error("Product not found");
 
-    const qty = Math.max(1, Number(quantity) || 1);
-    const unitPrice = Number(product.price);
+      const qty = Math.max(1, Number(quantity) || 1);
+      const unitPrice = String(product.price);
 
-    const existing = await SessionProduct.findOne({
-      where: { sessionId: session.id, productId },
-      transaction: tx
+      const [existing] = await tx
+        .select()
+        .from(sessionProducts)
+        .where(
+          and(eq(sessionProducts.sessionId, session.id), eq(sessionProducts.productId, productId))
+        );
+
+      let lineId;
+      if (existing) {
+        await tx
+          .update(sessionProducts)
+          .set({
+            quantity: sql`${sessionProducts.quantity} + ${qty}`,
+            updatedAt: new Date()
+          })
+          .where(eq(sessionProducts.id, existing.id));
+        lineId = existing.id;
+      } else {
+        const [created] = await tx
+          .insert(sessionProducts)
+          .values({
+            sessionId: session.id,
+            productId,
+            quantity: qty,
+            unitPrice
+          })
+          .returning();
+        lineId = created.id;
+      }
+
+      const [line] = await tx.select().from(sessionProducts).where(eq(sessionProducts.id, lineId));
+      const withProduct = { ...line, Product: product };
+      res.status(201).json(withProduct);
     });
-
-    let lineId;
-    if (existing) {
-      await existing.increment("quantity", { by: qty, transaction: tx });
-      lineId = existing.id;
-    } else {
-      const created = await SessionProduct.create(
-        {
-          sessionId: session.id,
-          productId,
-          quantity: qty,
-          unitPrice
-        },
-        { transaction: tx }
-      );
-      lineId = created.id;
-    }
-
-    const withProduct = await SessionProduct.findByPk(lineId, {
-      include: [{ model: Product }],
-      transaction: tx
-    });
-
-    await tx.commit();
-    res.status(201).json(withProduct);
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
 
 export const pauseSession = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { sessionId } = req.params;
-    const session = await Session.findByPk(sessionId, { transaction: tx });
-    if (!session || session.sessionStatus !== "active") {
-      throw new Error("Active session not found");
-    }
 
-    const activePause = await SessionPause.findOne({
-      where: { sessionId: session.id, pauseEnd: null },
-      transaction: tx
+    await db.transaction(async (tx) => {
+      const [session] = await tx.select().from(sessions).where(eq(sessions.id, Number(sessionId)));
+      if (!session || session.sessionStatus !== "active") {
+        throw new Error("Active session not found");
+      }
+
+      const [activePause] = await tx
+        .select()
+        .from(sessionPauses)
+        .where(and(eq(sessionPauses.sessionId, session.id), isNull(sessionPauses.pauseEnd)));
+      if (activePause) return res.status(400).json({ message: "Session is already paused" });
+
+      const [pause] = await tx
+        .insert(sessionPauses)
+        .values({ sessionId: session.id, pauseStart: new Date() })
+        .returning();
+
+      res.status(201).json(pause);
     });
-    if (activePause) return res.status(400).json({ message: "Session is already paused" });
-
-    const pause = await SessionPause.create(
-      { sessionId: session.id, pauseStart: new Date() },
-      { transaction: tx }
-    );
-    await tx.commit();
-    res.status(201).json(pause);
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
 
 export const resumeSession = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { sessionId } = req.params;
-    const session = await Session.findByPk(sessionId, { transaction: tx });
-    if (!session || session.sessionStatus !== "active") {
-      throw new Error("Active session not found");
-    }
 
-    const activePause = await SessionPause.findOne({
-      where: { sessionId: session.id, pauseEnd: null },
-      transaction: tx
+    await db.transaction(async (tx) => {
+      const [session] = await tx.select().from(sessions).where(eq(sessions.id, Number(sessionId)));
+      if (!session || session.sessionStatus !== "active") {
+        throw new Error("Active session not found");
+      }
+
+      const [activePause] = await tx
+        .select()
+        .from(sessionPauses)
+        .where(and(eq(sessionPauses.sessionId, session.id), isNull(sessionPauses.pauseEnd)));
+      if (!activePause) return res.status(400).json({ message: "Session is not paused" });
+
+      await tx
+        .update(sessionPauses)
+        .set({ pauseEnd: new Date(), updatedAt: new Date() })
+        .where(eq(sessionPauses.id, activePause.id));
+
+      const [updatedPause] = await tx
+        .select()
+        .from(sessionPauses)
+        .where(eq(sessionPauses.id, activePause.id));
+      res.json(updatedPause);
     });
-    if (!activePause) return res.status(400).json({ message: "Session is not paused" });
-
-    await activePause.update({ pauseEnd: new Date() }, { transaction: tx });
-    await tx.commit();
-    res.json(activePause);
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
 
 export const removeSessionProduct = async (req, res, next) => {
-  const tx = await sequelize.transaction();
   try {
     const { sessionId, lineId } = req.params;
 
-    const session = await Session.findByPk(sessionId, { transaction: tx });
-    if (!session || session.sessionStatus !== "active") {
-      throw new Error("Active session not found");
-    }
+    await db.transaction(async (tx) => {
+      const [session] = await tx.select().from(sessions).where(eq(sessions.id, Number(sessionId)));
+      if (!session || session.sessionStatus !== "active") {
+        throw new Error("Active session not found");
+      }
 
-    const line = await SessionProduct.findOne({
-      where: { id: lineId, sessionId: session.id },
-      transaction: tx
+      const [line] = await tx
+        .select()
+        .from(sessionProducts)
+        .where(
+          and(eq(sessionProducts.id, Number(lineId)), eq(sessionProducts.sessionId, session.id))
+        );
+      if (!line) return res.status(404).json({ message: "Line not found" });
+
+      await tx.delete(sessionProducts).where(eq(sessionProducts.id, line.id));
+      res.json({ message: "Product removed from session" });
     });
-    if (!line) return res.status(404).json({ message: "Line not found" });
-
-    await line.destroy({ transaction: tx });
-    await tx.commit();
-    res.json({ message: "Product removed from session" });
   } catch (error) {
-    await tx.rollback();
     next(error);
   }
 };
@@ -241,26 +267,38 @@ export const getDashboardSummary = async (req, res, next) => {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    const activePCs = await Session.count({ where: { sessionStatus: "active" } });
-    const todaysSessions = await Session.count({ where: { createdAt: { [Op.gte]: startOfToday } } });
+    const [activeRow] = await db
+      .select({ n: count() })
+      .from(sessions)
+      .where(eq(sessions.sessionStatus, "active"));
+    const activePCs = Number(activeRow?.n ?? 0);
 
-    const completedToday = await Session.findAll({
-      where: {
-        sessionStatus: "completed",
-        createdAt: { [Op.gte]: startOfToday }
-      }
-    });
+    const [todayCountRow] = await db
+      .select({ n: count() })
+      .from(sessions)
+      .where(gte(sessions.createdAt, startOfToday));
+    const todaysSessions = Number(todayCountRow?.n ?? 0);
+
+    const completedToday = await db
+      .select()
+      .from(sessions)
+      .where(
+        and(eq(sessions.sessionStatus, "completed"), gte(sessions.createdAt, startOfToday))
+      );
 
     const todaysEarnings = completedToday.reduce((a, s) => a + Number(s.paidAmount || 0), 0);
-    const totalPendingAmount = await Session.sum("pendingAmount", {
-      where: { sessionStatus: "completed" }
-    });
+
+    const [sumRow] = await db
+      .select({ s: sum(sessions.pendingAmount) })
+      .from(sessions)
+      .where(eq(sessions.sessionStatus, "completed"));
+    const totalPendingAmount = sumRow?.s;
 
     res.json({
       activePCs,
       todaysSessions,
       todaysEarnings,
-      totalPendingAmount: Number(totalPendingAmount || 0)
+      totalPendingAmount: Number(totalPendingAmount ?? 0)
     });
   } catch (error) {
     next(error);

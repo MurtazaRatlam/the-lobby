@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import app from "./app.js";
-import db from "./models/index.js";
+import { pool } from "./db/index.js";
 import { seedPCsIfEmpty } from "./seed/seedPCs.js";
 
 dotenv.config();
@@ -9,8 +9,12 @@ const PORT = process.env.PORT || 5000;
 
 const start = async () => {
   try {
-    await db.sequelize.authenticate();
-    await db.sequelize.sync();
+    const client = await pool.connect();
+    try {
+      await client.query("SELECT 1");
+    } finally {
+      client.release();
+    }
     await seedPCsIfEmpty();
     app.listen(PORT, () => {
       console.log(`Backend running on port ${PORT}`);
